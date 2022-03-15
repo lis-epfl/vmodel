@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+
+"""
+This script merges several netCDF4 (*.nc) datasets along a desired dimension,
+e.g., if several simulations have been performed with different group sizes.
+Example:
+    vmerge -vP --attr num_agents --dim nagents dataset_*.nc
+
+The above invocation will create a file `dataset_merged_num_agents.nc` from
+several datasets, e.g., `dataset_agents_10.nc`, `dataset_agents_100.nc`, etc.
+"""
+
+import argparse
+import os
+import sys
+
+import xarray as xr
+
+SCRIPT = os.path.basename(__file__)
+
+
+def main():
+
+    formatter_class = argparse.ArgumentDefaultsHelpFormatter
+    parser = argparse.ArgumentParser(description=SCRIPT,
+                                     formatter_class=formatter_class)
+
+    parser.add_argument('datasets', nargs='+', type=str, help='input datasets')
+    parser.add_argument('-o', '--output', type=str, default=None,
+                        help='output dataset filename')
+    parser.add_argument('-f', '--force', action='store_true', default=False,
+                        help='force overwriting of existing file')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                        help='verbose output')
+    parser.add_argument('-P', '--progress', action='store_true', default=False,
+                        help='show progress bar')
+    parser.add_argument('--attr', type=str, required=True,
+                        help='Attribute name')
+    parser.add_argument('--dim', type=str, required=True,
+                        help='Name of new dimension')
+
+    args = parser.parse_args()
+
+    def vprint(*pargs, **kwargs):
+        if args.verbose:
+            print(f'[{SCRIPT}]', *pargs, **kwargs)
+    eprint = lambda *args, **kwargs: vprint(*args, **kwargs, file=sys.stderr)
+
+    if args.output is None:
+        args.output = f'merged_{args.attr}.nc'
+
+    if len(args.datasets) < 2:
+        eprint('Need at least two datasets to merge. Exiting.')
+        sys.exit(-1)
+
+    vprint(f'Reading {len(args.datasets)} datasets')
+    datasets = [xr.load_dataset(p) for p in args.datasets]
+
+    # Add to dictionary and sort dataset
+    dsdict = {d.attrs[args.attr]: d for d in datasets}
+    dsdict = {k: d for k, d in sorted(dsdict.items())}
+
+    # Concatenate into big dataset
+    vprint('Merging datasets')
+    merged = xr.concat(dsdict.values(), args.dim)
+    merged.coords[args.dim] = list(dsdict.keys())
+
+    if os.path.exists(args.output) and not args.force:
+        eprint(f'Output dataset already exists: {args.output}. Overwrite with --force.')
+        sys.exit(-1)
+
+    vprint(f'Writing merged dataset: {args.output}')
+    merged.to_netcdf(args.output)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

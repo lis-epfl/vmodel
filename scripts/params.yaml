@@ -1,0 +1,4 @@
+seed: 1337
+verbose: true
+progress: true
+dry_run: true

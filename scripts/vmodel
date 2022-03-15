@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+
+"""
+This script is used to run flocking simulations. Refer to the README or list
+existing options using:
+    vmodel --help
+"""
+
+import argparse
+import functools
+import itertools
+import os
+import sys
+import time
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import psutil
+import tqdm
+import yaml
+from vmodel import geometry
+from vmodel import liveplot as plot
+from vmodel import metrics
+from vmodel.core import update_single
+from vmodel.dataset import create_dataset, generate_filename, save_dataset
+from vmodel.flocking import olfati_saber_simplified, reynolds
+from vmodel.random import random_positions
+from vmodel.util.args import parse_vmodel_args
+from vmodel.util.multiprocessing import get_silent_pool
+from vmodel.util.util import human_readable as hr
+from vmodel.visibility import visibility_graph
+
+SCRIPT = os.path.basename(__file__)
+
+
+def run(r, args, func):
+
+    # Set numpy random seed
+    np.random.seed(args.seed[r])
+
+    # Shorthands for arguments
+    nagents, dt = args.num_agents, args.delta_time
+
+    if args.progress:
+        pbar = tqdm.tqdm(total=args.num_timesteps, unit=' timesteps',
+                         desc=f'[vmodel] [run {r + 1}]', position=r)
+
+    data = argparse.Namespace()
+    data.time, data.pos, data.vel, data.vis, data.dist = [], [], [], [], []
+
+    if args.plot:
+        # _, (axpos, axdist, axvel) = plt.subplots(num='Plot', figsize=(7, 10), nrows=3,
+        #                                          gridspec_kw={'height_ratios': [2, 1, 1]})
+        _, axpos = plt.subplots(num='Plot', figsize=(7, 7))
+        _, (axdist, axvel, axmet) = plt.subplots(num='State', nrows=3, figsize=(7, 7))
+
+    # Compute metrics only when plotting them
+    if args.plot_metrics:
+        # _, axmet = plt.subplots(num='Metrics', figsize=(7, 7))
+        data.ord, data.con, data.union, data.aspect = [], [], [], []
+
+    positions = random_positions(nagents, args.spawn, args)
+    velocities = np.zeros_like(positions)
+
+    if args.parallel_agents:
+        pool = get_silent_pool(args.jobs)
+        warnings.warn('Cannot generate reproducible results with multiprocessing')
+
+    # Timestep zero: add initial conditions to data
+    t = 0.0
+    data.time.append(t)
+    data.pos.append(positions.copy())
+    data.vel.append(velocities.copy())
+    data.dist.append(geometry.distance_matrix(positions))
+    data.vis.append(visibility_graph(positions, args.radius))
+
+    # Compute metrics for zeroth timestep
+    if args.plot_metrics:
+        compute_metrics(data)
+
+    for k in itertools.count(start=1, step=1):
+
+        t += dt  # Integrate time
+
+        if args.num_timesteps is not None and k >= args.num_timesteps:
+            break
+
+        if args.progress:
+            pbar.update(1)
+
+        # List to hold precomputed distance and visibility data
+        vis_list, dist_list = [], []
+
+        # Compute updates, either in parallel or sequentially
+        if args.parallel_agents:
+            args_list = [(i, positions, func, args) for i in range(nagents)]
+            updates = pool.starmap_async(update_single, args_list).get(9999999)
+        else:
+            updates = [update_single(i, positions, func, args) for i in range(nagents)]
+
+        for i in range(nagents):
+
+            cmd, cache = updates[i]
+
+            # Compute new position from velocity command
+            pos = positions[i] + cmd * dt
+
+            # Save position and velocity
+            positions[i] = pos
+            velocities[i] = cmd
+
+            # Save precomputed items
+            vis_list.append(cache.vis.copy())
+            dist_list.append(cache.dist.copy())
+
+        # Save data
+        if k % args.save_every == 0:
+            data.time.append(t)
+            data.pos.append(positions.copy())
+            data.vel.append(velocities.copy())
+
+            if not args.no_save_precomputed or args.plot:
+
+                # Save visbility in any case
+                vmat = [np.insert(vs, i, False) for i, vs in enumerate(vis_list)]
+                data.vis.append(np.array(vmat))
+
+                # Save distance *only* when plotting (can easily be re-computed)
+                # Note: memory requirements blow up if this if-statement is not there
+                if args.plot:
+                    dmat = [np.insert(ds, i, 0.0) for i, ds in enumerate(dist_list)]
+                    data.dist.append(np.array(dmat))
+
+            if args.plot_metrics:
+                compute_metrics(data)
+
+        # Plotting
+        if args.plot or args.plot_metrics:
+            last_step = (args.num_timesteps is not None and k + 1 == args.num_timesteps)
+            if k % args.plot_every == 0 or last_step:
+                if args.plot:
+                    plot.plot_all(axpos, data, args)
+                    # plot_agents(axpos, data, args)
+                    plot_distances(axdist, data, args)
+                    plot_speed(axvel, data, args)
+                    # plot.plot_clutter(axpos, clutter_list)
+                if args.plot_metrics:
+                    plot_metrics(axmet, data)
+
+                # Wait for keypress if blocking, otherwise wait for dt and continue
+                if args.plot_blocking:
+                    while plt.waitforbuttonpress() is False:  # false -> mouse press
+                        pass  # do nothing until true -> key press
+                else:
+                    plt.pause(args.delta_time)
+
+    if args.plot:
+        plt.show()
+
+    del data.dist  # Save memory. Distance matrix can easily be re-computed...
+
+    # Delete precomputed data if we're not saving it anyways...
+    if args.no_save_precomputed:
+        del data.vis
+
+    return data
+
+
+def compute_metrics(data):
+    # data.con.append(metrics.connectivity(data.vis[-1]))
+    data.con.append(metrics.connectivity(data.vis[-1]))
+    data.union.append(metrics.union(data.vis[-1]))
+    data.ord.append(metrics.order(data.vel[-1]))
+    data.aspect.append(metrics.aspect_ratio(data.pos[-1]))
+
+
+def plot_distances(ax, data, args):
+    ax.clear()
+    plot.plot_distances(ax, data.dist, data.time, radius=args.radius)
+    ax.set(xlabel='time [s]', ylabel='distance [m]')
+    ax.set(xlim=(0, data.time[-1]), ylim=(0, None))
+    ax.legend(loc='lower right')
+    ax.grid(True)
+
+
+def plot_speed(ax, data, args):
+    ax.clear()
+    plot.plot_speed(ax, data.vel, data.time)
+    ax.set(xlabel='time [s]', ylabel='speed [m/s]')
+    ax.set(xlim=(0, data.time[-1]), ylim=(0, None))
+    ax.legend(loc='upper right')
+    ax.grid(True)
+
+
+def plot_metrics(ax, data):
+    ax.clear()
+
+    # Plot order
+    plot.plot_metric(ax, data.ord, data.time, name='order',
+                     color='tab:green')
+
+    # Plot connectivity
+    plot.plot_metric(ax, data.con, data.time, name='connectivity',
+                     color='tab:blue')
+
+    # Plot union
+    plot.plot_metric(ax, data.union, data.time, name='union',
+                     color='tab:orange')
+
+    # Plot aspect
+    plot.plot_metric(ax, data.aspect, data.time, name='aspect ratio',
+                     color='tab:cyan')
+
+    ax.set(xlabel='time [s]', ylabel='metric [?]')
+    ax.set(xlim=(0, data.time[-1]), ylim=(0, None))
+    ax.legend(loc='lower right')
+    ax.grid(True)
+
+
+def main():
+
+    args = parse_vmodel_args()
+
+    # Load arguments from file (overwrites CLI arguments!)
+    if args.file != '':
+        file_dict = yaml.load(open(args.file, 'r'), Loader=yaml.FullLoader)
+        args.__dict__.update(file_dict)
+
+    # Define convenience print function (only prints in verbose mode)
+    def vprint(*pargs, **kwargs):
+        if args.verbose:
+            print(f'[{SCRIPT}]', *pargs, **kwargs)
+    eprint = lambda *args, **kwargs: vprint(*args, **kwargs, file=sys.stderr)
+
+    # Only perception radius or perception angle can be defined
+    if args.perception_radius > 0 and args.perception_angle > 0:
+        eprint('Define either perception radius or angle, not both')
+        sys.exit(-1)
+
+    if args.migration_point and args.migration_dir:
+        eprint('Define either migration point or migration direction, not both')
+        sys.exit(-1)
+
+    # Save current git hash (for repeatable experiments)
+    try:
+        import git
+        repo = git.Repo(os.path.realpath(__file__), search_parent_directories=True)
+        args.git_hash = repo.head.object.hexsha
+        args.git_branch = repo.active_branch.name
+    except ImportError:
+        eprint('Install gitpython to save current git branch and hash')
+        exit()
+
+    # Sample and save random seed for repeatable experiments
+    if args.seed is None:
+        # Sample positive 31 bit integers
+        args.seed = np.random.randint(2 ** 31 - 1, size=args.num_runs)
+    elif isinstance(args.seed, (int, float)):
+        # Use the same seed for each run
+        args.seed = np.full(args.num_runs, args.seed)
+    elif isinstance(args.seed, list):
+        # If we pass multiple seed values, we are trying to run the same experiment again
+        if len(args.seed) != args.num_runs:
+            eprint('If providing list of seeds, provide one for each run')
+            exit(0)
+        args.seed = np.array(args.seed)
+
+    vprint(f'Using random seed: {args.seed.tolist()}')
+
+    # Check if we have enough memory available
+    mem = psutil.virtual_memory()
+    num_bytes_float64, num_states = 8, 2  # position and velocity
+    num_per_step = args.num_runs * args.num_agents * args.num_dims / args.save_every
+    num_bytes_per_step = num_per_step * num_bytes_float64 * num_states
+    if args.num_timesteps is not None:
+        mem_req = num_bytes_per_step * args.num_timesteps
+        vprint(f'RAM required: {hr(mem_req)} (Used: {hr(mem.used)}/{hr(mem.total)})')
+        if mem_req > mem.available:
+            eprint('Script will consume more memory than is available. Exiting.')
+            sys.exit(0)
+    else:
+        vprint(f'RAM required per timestep: {hr(num_bytes_per_step)}')
+
+    # Derived variables
+    args.radius_collision = 2 * args.radius
+    args.radius_safety = 2 * args.radius_collision
+
+    if args.algorithm == 'reynolds':
+        # For Reynolds algorithm, infer separation gain in case of Reynolds flocking
+        if args.ref_distance is not None:
+            args.cohesion_gain = 1.0
+            args.separation_gain = reynolds.infer_separation_gain3(args.ref_distance)
+            vprint(f'Setting separation gain to {args.separation_gain:.2f}')
+        func = functools.partial(reynolds.flock, cohesion_gain=args.cohesion_gain,
+                                 separation_gain=args.separation_gain)
+    elif args.algorithm == 'olfati':
+        # For Olfati algorithm, set perception radius to 1.2 * dist
+        if args.perception_radius is None:
+            args.perception_radius = 1.2 * args.ref_distance
+            vprint(f'Setting perception radius to {args.perception_radius:.2f}')
+        func = functools.partial(olfati_saber_simplified.flock,
+                                 distance=args.ref_distance,
+                                 perception_radius=args.perception_radius)
+
+    if args.spawn_distance is None:
+        args.spawn_distance = args.ref_distance
+
+    # Calculate desired radius of arena to keep agent number density constant
+    args.mean_area_per_agent = np.pi * args.spawn_distance ** 2
+    args.radius_arena = np.sqrt(args.num_agents * args.mean_area_per_agent / np.pi)
+
+    # Agent density
+    area_arena = np.pi * args.radius_arena ** 2
+    agent_number_density = args.num_agents / area_arena
+    vprint(f'Agent number density: {agent_number_density:.2f} agents/m^2')
+
+    # Migration
+    if len(args.migration_dir) > 0:
+        direction = np.array(args.migration_dir)
+        args.migration_dir = direction / np.linalg.norm(direction)
+
+    args.radius_migration_point = 1.0  # only relevant for visual migration
+
+    if args.plot and (args.save_every > args.plot_every):
+        eprint('Cannot plot more often than saving. Consider lowering --save-every')
+        exit()
+
+    # No need for parallelizing runs if there is just one
+    args.no_parallel_runs = True if args.num_runs == 1 else args.no_parallel_runs
+
+    # Time run to obtain real-time factor
+    time_start = time.time()
+
+    if args.no_parallel_runs:
+        datas = [run(r, args, func) for r in range(args.num_runs)]
+    else:
+        pool = get_silent_pool(args.jobs)
+        args_list = [(r, args, func) for r in range(args.num_runs)]
+        datas = pool.starmap_async(run, args_list).get(9999999)  # don't judge!
+
+    duration = time.time() - time_start
+    vprint(f'Total duration: {duration:.2f} seconds')
+
+    if args.dry_run:
+        vprint('Dry run. Exiting without writing data.')
+        sys.exit(0)
+
+    # Create dataset from multiple runs
+    ds = create_dataset(datas, args)
+
+    # Generate filename: date_args.ext
+    fname = generate_filename(args)
+
+    # Save dataset and config file
+    vprint(f'Saving {args.format} file: {fname}')
+    save_dataset(ds, fname, args)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

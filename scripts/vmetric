@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+
+"""
+This script computes flocking metrics from simulation runs saved as netCDF4.
+Example:
+    vmetric -vP dataset.nc
+The above invocation will create a new metric dataset `dataset.metrics.nc` from
+a simulation run contained in `dataset.nc`.
+"""
+
+import argparse
+import os
+import sys
+import time
+
+import xarray as xr
+from dask.diagnostics import ProgressBar
+from vmodel import metrics as vmetr
+from vmodel.util import xarray as xmetr
+
+SCRIPT = os.path.basename(__file__)
+
+
+def compute_metrics(ds, dsmetric, args):
+
+    # Slice of time to speed up computation
+    ds = ds.isel(time=slice(None, None, args.time_slice))
+
+    # Chunk dataset
+    ds = ds.chunk({'time': 10})
+
+    metric = 'nndist'
+    if metric not in dsmetric:
+        dsmetric[metric] = xmetr.nndist(ds.position)
+
+    metric = 'order'
+    if metric not in dsmetric:
+        dims = ['agent', 'space']
+        dsmetric[metric] = xmetr.metric_ufunc(ds.velocity, vmetr.order, dims)
+
+    metric = 'union'
+    if metric not in dsmetric:
+        dims = ['agent', 'agent2']
+        dsmetric[metric] = xmetr.metric_ufunc(ds.visibility, vmetr.union, dims)
+
+    # Computing connectivity takes very long
+    # metric = 'connectivity'
+    # if metric not in dsmetric:
+    #     dims = ['agent', 'agent2']
+    #     dsmetric[metric] = xmetr.metric_ufunc(ds.visibility, vmetr.connectivity, dims)
+
+    metric = 'density'  # technically a number density since nagents / area
+    if metric not in dsmetric:
+        dims = ['agent', 'space']
+        dsmetric[metric] = xmetr.metric_ufunc(ds.position, vmetr.agent_density, dims)
+
+    metric = 'traveldist'  # distance of agent mean position between first & last timestep
+    if metric not in dsmetric:
+        meanpos = ds.position.mean('agent')
+        traveldist = xmetr.norm(meanpos.isel(time=0) - meanpos.isel(time=-1), 'space')
+        dsmetric[metric] = traveldist
+
+    metric = 'nvisible'
+    if metric not in dsmetric:
+        # Convert to float to preserve NaNs when merging datasets!
+        nvisible = ds.visibility.sum('agent2').astype(float)
+        dsmetric[metric] = nvisible
+
+    return dsmetric
+
+
+def main():
+
+    formatter_class = argparse.ArgumentDefaultsHelpFormatter
+    parser = argparse.ArgumentParser(description=SCRIPT,
+                                     formatter_class=formatter_class)
+
+    parser.add_argument('dataset', nargs='+', type=str, help='input dataset(s)')
+    parser.add_argument('-a', '--append', action='store_true', default=False,
+                        help='append metrics to existing dataset')
+    parser.add_argument('-f', '--force', action='store_true', default=False,
+                        help='force overwriting of existing file')
+    parser.add_argument('-n', '--dry-run', action='store_true', default=False,
+                        help='dry run, do not save data')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                        help='verbose output')
+    parser.add_argument('-P', '--progress', action='store_true', default=False,
+                        help='show progress bar')
+    parser.add_argument('--time-slice', type=int, default=1,
+                        help='time slice')
+
+    args = parser.parse_args()
+
+    def vprint(*pargs, **kwargs):
+        if args.verbose:
+            print(f'[{SCRIPT}]', *pargs, **kwargs)
+    eprint = lambda *args, **kwargs: vprint(*args, **kwargs, file=sys.stderr)
+
+    start_time = time.time()
+
+    for i, inpath in enumerate(args.dataset):
+
+        # Skip files that are already metrics
+        metric_ext = '.metrics.nc'
+        if metric_ext in inpath:
+            eprint(f'Skipping metric dataset: {inpath}')
+            continue
+
+        # Construct outpath
+        path_without_ext = os.path.splitext(inpath)[0]
+        outpath = f'{path_without_ext}{metric_ext}'
+
+        # Check if metrics dataset already exists
+        dsmetric = xr.Dataset()
+        if os.path.exists(outpath):
+            # Take existing dataset to append to
+            if args.append:
+                vprint(f'Appending to existing metric dataset: {outpath}')
+                dsmetric = xr.load_dataset(outpath)
+            if not (args.append or args.force):
+                eprint(f'Metrics dataset already exists: {outpath}. Exiting.')
+                sys.exit(-1)
+
+        vprint(f'Reading dataset: {inpath}')
+        ds = xr.open_dataset(inpath)  # state dataset
+        # If dataset has position, then it's a state dataset
+        try:
+            ds.position
+        except AttributeError:
+            continue
+        dsmetric.attrs = ds.attrs  # copy attrs
+
+        vprint('Computing metrics...')
+        dsmetric = compute_metrics(ds, dsmetric, args)
+
+        if not args.dry_run:
+            vprint(f'Writing output file: {outpath}')
+            if args.progress:
+                with ProgressBar():
+                    dsmetric.to_netcdf(outpath)
+            else:
+                dsmetric.to_netcdf(outpath)
+
+    duration = time.time() - start_time
+    vprint(f'Metrics computed in {duration:.2f}s')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
